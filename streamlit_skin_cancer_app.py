@@ -5,87 +5,46 @@ from tensorflow.keras.models import load_model
 from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
+import os
 
 # === Variables globales pour le cache ===
 converted_model_cache = None
 
-# === Fonction de conversion avec noms uniques ===
-def convert_sequential_to_functional_unique_names(model):
-    """
-    Convertir un modèle Sequential en Functional avec des noms uniques
-    """
-    try:
-        # Nettoyer la session pour éviter les conflits de noms
-        tf.keras.backend.clear_session()
-        
-        # Créer l'input avec un nom unique
-        input_layer = tf.keras.layers.Input(shape=(64, 64, 3), name='gradcam_input')
-        
-        # Passer l'input à travers toutes les couches
-        x = input_layer
-        
-        for i, layer in enumerate(model.layers):
-            # Créer une copie de la couche avec un nom unique
-            layer_config = layer.get_config()
-            layer_class = type(layer)
-            
-            # Assigner un nom unique si nécessaire
-            if 'name' in layer_config:
-                layer_config['name'] = f"gradcam_{layer_config['name']}_{i}"
-            
-            # Créer la nouvelle couche
-            new_layer = layer_class.from_config(layer_config)
-            
-            # Copier les poids si ils existent
-            if layer.weights:
-                new_layer.build(x.shape)
-                new_layer.set_weights(layer.get_weights())
-            
-            x = new_layer(x)
-        
-        # Créer le modèle Functional avec un nom unique
-        functional_model = tf.keras.Model(
-            inputs=input_layer, 
-            outputs=x, 
-            name='gradcam_functional_model'
-        )
-        
-        return functional_model
-        
-    except Exception as e:
-        st.error(f"❌ Erreur conversion: {e}")
-        return None
+# === Diagnostic des fichiers ===
+files_to_check = [
+    "skin_cancer_model.weights.h5",
+    "skin_cancer_model.h5", 
+    "skin_cancer_model.keras",
+    "skin_cancer_model_savedmodel"
+]
+
+st.write("🔍 **Fichiers de modèle disponibles:**")
+for file in files_to_check:
+    if os.path.exists(file):
+        size_mb = os.path.getsize(file) / (1024 * 1024)
+        st.write(f"✅ {file} trouvé ({size_mb:.1f} MB)")
+    else:
+        st.write(f"❌ {file} non trouvé")
 
 # === Fonction Grad-CAM optimisée pour Streamlit ===
 def make_gradcam_for_streamlit(img_array, model, layer_search_name, pred_index=None):
     """
-    Version Grad-CAM optimisée pour Streamlit
+    Version Grad-CAM simplifiée pour les modèles déjà fonctionnels
     """
-    global converted_model_cache
-    
     try:
-        # Utiliser le cache si disponible
-        if converted_model_cache is None:
-            if isinstance(model, tf.keras.Sequential):
-                with st.spinner("🔄 Conversion du modèle (une seule fois)..."):
-                    converted_model_cache = convert_sequential_to_functional_unique_names(model)
-                    if converted_model_cache is None:
-                        return None
-                st.success("✅ Modèle converti avec succès")
-            else:
-                converted_model_cache = model
-        
-        working_model = converted_model_cache
+        # SIMPLIFICATION MAJEURE : Plus besoin de conversion ou de cache complexe
+        working_model = model
         
         # Trouver la couche convolutionnelle
         conv_layer = None
         for layer in working_model.layers:
-            if layer_search_name in layer.name:
+            # On cherche un nom exact car les noms peuvent être complexes
+            if layer.name == layer_search_name:
                 conv_layer = layer
                 break
         
         if conv_layer is None:
-            st.error(f"Couche contenant '{layer_search_name}' introuvable")
+            st.error(f"Couche '{layer_search_name}' introuvable. Couches disponibles: {[l.name for l in working_model.layers]}")
             return None
         
         # S'assurer que l'entrée est un tensor
@@ -143,13 +102,19 @@ def make_gradcam_for_streamlit(img_array, model, layer_search_name, pred_index=N
             st.code(traceback.format_exc())
         return None
 
-# === Diagnostic du modèle ===
+# === Diagnostic du modèle adapté ===
 def diagnose_model_streamlit(model):
-    """Diagnostic du modèle pour Streamlit"""
+    """Diagnostic du modèle pour Streamlit (compatible avec wrapper)"""
     try:
         st.info("🔍 Analyse du modèle...")
         
-        # Informations de base
+        # Vérifier si c'est notre wrapper ou un modèle Keras normal
+        if isinstance(model, SavedModelWrapper):
+            st.info("📋 Modèle: SavedModel avec wrapper")
+            st.warning("⚠️ Grad-CAM non disponible avec SavedModel")
+            return []  # Pas de couches conv disponibles pour Grad-CAM
+        
+        # Modèle Keras normal
         model_type = type(model).__name__
         layer_count = len(model.layers)
         
@@ -180,33 +145,109 @@ def diagnose_model_streamlit(model):
         st.error(f"❌ Erreur lors du diagnostic: {e}")
         return []
 
-# === Chargement robuste du modèle ===
+# === WRAPPER POUR SAVEDMODEL ===
+class SavedModelWrapper:
+    """Wrapper pour utiliser un SavedModel comme un modèle Keras"""
+    
+    def __init__(self, savedmodel_path):
+        self.model = tf.saved_model.load(savedmodel_path)
+        self.serving_fn = self.model.signatures['serving_default']
+        
+        # Analyser la signature pour comprendre les entrées/sorties
+        self.input_key = list(self.serving_fn.structured_input_signature[1].keys())[0]
+        self.output_key = list(self.serving_fn.structured_outputs.keys())[0]
+        
+        st.info(f"📋 Input key: {self.input_key}")
+        st.info(f"📋 Output key: {self.output_key}")
+    
+    def predict(self, x, verbose=0):
+        """Méthode predict compatible avec Keras"""
+        # Convertir l'entrée au bon format
+        if isinstance(x, np.ndarray):
+            x = tf.convert_to_tensor(x, dtype=tf.float32)
+        
+        # Faire la prédiction avec la signature
+        input_dict = {self.input_key: x}
+        output = self.serving_fn(**input_dict)
+        
+        # Extraire la sortie
+        result = output[self.output_key].numpy()
+        return result
+    
+    @property
+    def layers(self):
+        """Propriété layers fictive pour compatibilité"""
+        return []
+
+# === NOUVELLE FONCTION DE CHARGEMENT CORRIGÉE ===
 @st.cache_resource
 def load_skin_cancer_model_robust():
-    try:
-        st.info("🔄 Chargement du modèle...")
-        
-        # Nettoyer la session
-        tf.keras.backend.clear_session()
-        
-        # Charger le modèle
-        model = load_model("skin_cancer_model.h5", compile=False)
-        st.success("✅ Modèle chargé avec succès")
-        
-        # Construire le modèle si nécessaire
-        if not model.built:
-            model.build(input_shape=(None, 64, 64, 3))
-        
-        # Test de fonctionnement
-        dummy_input = tf.zeros((1, 64, 64, 3), dtype=tf.float32)
-        _ = model(dummy_input, training=False)
-        st.success("✅ Test de prédiction réussi")
-        
-        return model
-        
-    except Exception as e:
-        st.error(f"❌ Erreur critique: {e}")
-        raise e
+    """
+    Charge le modèle en essayant plusieurs méthodes dans l'ordre de préférence
+    """
+    
+    # MÉTHODE 1: SavedModel avec wrapper (PRIORITÉ car c'est ce qui fonctionne)
+    if os.path.isdir("skin_cancer_model_savedmodel"):
+        try:
+            # Vérifier que le dossier contient bien des fichiers
+            savedmodel_files = []
+            for root, dirs, files in os.walk("skin_cancer_model_savedmodel"):
+                savedmodel_files.extend(files)
+            
+            if len(savedmodel_files) > 0:
+                st.info(f"🔄 Chargement du SavedModel... ({len(savedmodel_files)} fichiers trouvés)")
+                
+                # D'abord, essayer le chargement Keras normal
+                try:
+                    model = tf.keras.models.load_model("skin_cancer_model_savedmodel")
+                    if hasattr(model, 'predict') and hasattr(model, 'layers'):
+                        st.success("✅ SavedModel Keras chargé avec succès !")
+                        return model
+                except:
+                    pass
+                
+                # Si ça ne marche pas, utiliser notre wrapper
+                st.info("🔄 Utilisation du wrapper SavedModel...")
+                wrapped_model = SavedModelWrapper("skin_cancer_model_savedmodel")
+                st.success("✅ SavedModel avec wrapper chargé avec succès !")
+                return wrapped_model
+            else:
+                st.warning("⚠️ Dossier SavedModel vide")
+                
+        except Exception as e:
+            st.warning(f"❌ Échec SavedModel: {str(e)[:100]}...")
+            with st.expander("🔍 Détails erreur SavedModel"):
+                st.code(str(e))
+    
+    # MÉTHODE 2: Essayer .h5 avec des options compatibilité
+    if os.path.exists("skin_cancer_model.h5"):
+        try:
+            st.info("🔄 Chargement du modèle .h5 (mode compatibilité)...")
+            model = tf.keras.models.load_model("skin_cancer_model.h5", compile=False)
+            st.success("✅ Modèle .h5 chargé avec succès !")
+            return model
+        except Exception as e:
+            st.warning(f"❌ Échec .h5: {str(e)[:100]}...")
+    
+    # MÉTHODE 3: Essayer .keras avec des options compatibilité
+    if os.path.exists("skin_cancer_model.keras"):
+        try:
+            st.info("🔄 Chargement du modèle .keras (mode compatibilité)...")
+            model = tf.keras.models.load_model("skin_cancer_model.keras", compile=False)
+            st.success("✅ Modèle .keras chargé avec succès !")
+            return model
+        except Exception as e:
+            st.warning(f"❌ Échec .keras: {str(e)[:100]}...")
+    
+    # Si aucune méthode n'a fonctionné
+    st.error("❌ Toutes les méthodes de chargement ont échoué")
+    st.info("💡 **Solutions:**")
+    st.write("1. Le SavedModel semble être votre meilleur option")
+    st.write("2. Vérifiez votre version de TensorFlow")
+    st.write("3. Essayez: `pip install tensorflow==2.15.0`")
+    st.write("4. Ou régénérez le modèle avec votre version actuelle")
+    
+    raise Exception("Impossible de charger le modèle avec toutes les méthodes disponibles")
 
 # === Noms et descriptions des classes ===
 class_names = {
@@ -242,10 +283,10 @@ try:
     
 except Exception as e:
     st.error(f"❌ Impossible de charger le modèle: {e}")
-    st.info("💡 Solutions possibles:")
-    st.write("- Vérifiez que le fichier 'skin_cancer_model.h5' existe")
-    st.write("- Le modèle pourrait être corrompu")
-    st.write("- Essayez de réentraîner le modèle")
+    st.info("💡 **Solutions possibles:**")
+    st.write("- Vérifiez que vos fichiers de modèle (.h5, .keras) ne sont pas corrompus")
+    st.write("- Réentraînez votre modèle si nécessaire")
+    st.write("- Assurez-vous d'avoir sauvegardé le modèle complet (pas seulement les poids)")
     st.stop()
 
 # === Interface utilisateur ===
@@ -262,11 +303,7 @@ if uploaded_file is not None:
         
         # Prédiction
         with st.spinner("🔮 Analyse en cours..."):
-            # Utiliser le modèle converti s'il existe, sinon le modèle original
-            if converted_model_cache is not None:
-                prediction = converted_model_cache.predict(img_array, verbose=0)
-            else:
-                prediction = model.predict(img_array, verbose=0)
+            prediction = model.predict(img_array, verbose=0)
             
             predicted_index = np.argmax(prediction)
             predicted_key = list(class_names.keys())[predicted_index]
@@ -302,12 +339,11 @@ if uploaded_file is not None:
             st.pyplot(fig)
         
         with col2:
-            # Grad-CAM
             st.subheader("🧠 Analyse Grad-CAM")
-            
             if conv_layers:
-                # Utiliser la dernière couche convolutionnelle par défaut
-                layer_to_use = 'conv2d_4'  # ou la dernière couche disponible
+                layer_to_use = conv_layers[-1] 
+                
+                st.info(f"🧠 Utilisation de la couche : **{layer_to_use}**")
                 
                 # Générer la heatmap
                 with st.spinner("🔥 Génération de la carte de chaleur..."):
@@ -336,9 +372,19 @@ if uploaded_file is not None:
                         st.error(f"❌ Erreur lors de la visualisation: {e}")
                 else:
                     st.error("❌ Impossible de générer la carte Grad-CAM")
+            elif isinstance(model, SavedModelWrapper):
+                st.info("ℹ️ **Grad-CAM non disponible avec SavedModel**")
+                st.write("Le modèle fonctionne mais les couches internes ne sont pas accessibles.")
+                st.write("Pour avoir Grad-CAM, utilisez un modèle .h5 ou .keras.")
+                
+                # Afficher quand même l'image originale
+                st.image(img, caption="🖼️ Image analysée", use_column_width=True)
             else:
                 st.warning("⚠️ Pas de couches convolutionnelles détectées")
                 st.info("Le modèle ne semble pas compatible avec Grad-CAM")
+                
+                # Afficher quand même l'image originale
+                st.image(img, caption="🖼️ Image analysée", use_column_width=True)
                 
     except Exception as e:
         st.error(f"❌ Erreur lors du traitement: {e}")
@@ -346,14 +392,11 @@ if uploaded_file is not None:
             import traceback
             st.code(traceback.format_exc())
 
-
-
 # === Informations ===
 st.markdown("---")
 st.subheader("ℹ️ À propos")
 st.markdown("""
 Cette application utilise un modèle de deep learning pour classifier les lésions cutanées:
-
 
 **Classes détectées:**
 - **Mélanome (mel)** ⚠️ : Cancer dangereux
@@ -364,10 +407,7 @@ Cette application utilise un modèle de deep learning pour classifier les lésio
 - **Dermatofibrome (df)** ✅ : Tumeur bénigne
 - **Lésion vasculaire (vasc)** ✅ : Anomalie bénigne
 
-
 **Grad-CAM** montre les zones sur lesquelles le modèle se concentre pour prendre sa décision.
 """)
 
-
 st.error("⚠️ **AVERTISSEMENT MÉDICAL**: Application à but éducatif uniquement. Consultez un professionnel pour un diagnostic médical.")
-
